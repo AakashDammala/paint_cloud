@@ -14,6 +14,7 @@ from sensor_msgs_py import point_cloud2
 import tf2_ros
 import tf_transformations
 from geometry_msgs.msg import TransformStamped, PoseArray, Pose, PolygonStamped, Point32
+from paint_cloud_msgs.srv import GetPaintPath
 from scipy.spatial import cKDTree
 
 def quaternion_from_normal(normal):
@@ -60,6 +61,9 @@ class PaintCloud(Node):
         self.path_pub = self.create_publisher(PoseArray, 'paint_path', 10)
         self.polygon_pub = self.create_publisher(PolygonStamped, 'surface_polygon', 10)
 
+        # Services
+        self.srv = self.create_service(GetPaintPath, 'get_paint_path', self.get_paint_path_callback)
+
         # Subscribers
         self.create_subscription(
             PointCloud2,
@@ -82,12 +86,35 @@ class PaintCloud(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        timer_period = 5  # seconds
-        self.timer = self.create_timer(timer_period, self.timer_callback)
+        # timer_period = 5  # seconds
+        # self.timer = self.create_timer(timer_period, self.timer_callback)
 
         self.get_logger().info("Started the paint_cloud node")
 
     def timer_callback(self):
+        self.scan_pc_generate_path()
+
+    def get_paint_path_callback(self, request, response):
+        """
+        Callback for the GetPaintPath service.
+        Triggers path generation and returns the result.
+        """
+        self.get_logger().info("Incoming request for Paint Path")
+        
+        path = self.scan_pc_generate_path()
+        
+        if path:
+            response.poses = path
+            self.get_logger().info(f"Returning path with {len(path.poses)} poses")
+        else:
+            self.get_logger().warn("Path generation failed or returned None")
+            response.poses = PoseArray() 
+            if self.pcd_header:
+                response.poses.header = self.pcd_header
+            
+        return response
+    
+    def scan_pc_generate_path(self):
         if self.points is None:
             self.get_logger().info("Waiting for pointcloud...")
             return
@@ -96,6 +123,7 @@ class PaintCloud(Node):
         self.generate_path()
         self.publish_message()
         self.get_logger().info("Published the message")
+        return self.generated_path
 
     def generate_mock_pc(self):
         """
