@@ -13,7 +13,7 @@ import struct
 from sensor_msgs_py import point_cloud2
 import tf2_ros
 import tf_transformations
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, PoseArray, Pose, PolygonStamped, Point32
 
 
 class PaintCloud(Node):
@@ -24,6 +24,8 @@ class PaintCloud(Node):
         self.pcd_pub = self.create_publisher(PointCloud2, 'curved_cloud', 10)
         self.normal_pub = self.create_publisher(
             MarkerArray, 'surface_normals', 10)
+        self.path_pub = self.create_publisher(PoseArray, 'paint_path', 10)
+        self.polygon_pub = self.create_publisher(PolygonStamped, 'surface_polygon', 10)
 
         # Subscribers
         self.create_subscription(
@@ -34,9 +36,14 @@ class PaintCloud(Node):
         )
 
         self.declare_parameter('downsample_factor', 100)
+        self.declare_parameter('brush_radius', 0.1)
+        self.declare_parameter('overlap_factor', 1.0)
+        self.declare_parameter('surface_length_x', 1.0)
+        self.declare_parameter('surface_width_y', 0.8)
 
         self.points = None
         self.pcd_header = None
+        self.generated_path = None
         
         # TF Listener
         self.tf_buffer = tf2_ros.Buffer()
@@ -53,6 +60,7 @@ class PaintCloud(Node):
             return
 
         self.estimate_surface_normals()
+        self.generate_path()
         self.publish_message()
         self.get_logger().info("Published the message")
 
@@ -191,6 +199,121 @@ class PaintCloud(Node):
         self.get_logger().info(
             f"Generated {len(self.points)} points with normals.")
 
+    def generate_path(self):
+        """
+        Take the following inputs
+          - Surface normals (take into account that the normals are wrt sensor frame x axis)
+          - paint brush radius
+          - Surface size (length x width) (if length is 1m and width is 0.8m, the booundaries of painting box are x(-0.5m to 0.5m) and y(-0.4m to 0.4m))
+
+        How to generate the path?
+          - Generate zig lines (ends spanning outside the width of surface)
+          - The distance between these lines should be overlap_factor x (2x brush_radius)
+          - Higher the overlap factor, more closer the lines will be, ideally it should be 1.0
+        
+        With the overlap factor as 1.0, paint brush radius as 0.1m, the path generated will be as follows:
+          (-0.6, -0.5), (-0.6, 0.5), (-0.4, 0.5), (-0.4, -0.5), (-0.2, -0.5), (-0.2, 0.5), (0.0, 0.5), (0.0, -0.5), (0.2, -0.5), (0.2, 0.5), (0.4, 0.5), (0.4, -0.5), (0.6, -0.5), (0.6, 0.5)
+          (The path starts 0.1m from the left and right edges of the surface)
+          Save this points waypoints, in the same zig zag order
+
+        Once these waypoints are generated, interpolate sub points in between these points, with a distance of 0.1m (parameter)
+        These sub points will be stored as geometry_msgs/PoseArray message
+        The orientation will be 0, 0, 0 for now, and Z will be 0.0 for now
+        """
+        if self.points is None:
+            return
+
+        # Fetch Parameters
+        brush_radius = self.get_parameter('brush_radius').get_parameter_value().double_value
+        surface_length_x = self.get_parameter('surface_length_x').get_parameter_value().double_value
+        surface_width_y = self.get_parameter('surface_width_y').get_parameter_value().double_value
+        overlap_factor = self.get_parameter('overlap_factor').get_parameter_value().double_value
+
+        # Calculate limits based on surface dimensions (centered at 0,0)
+        x_half = surface_length_x / 2.0
+        y_half = surface_width_y / 2.0
+
+        # Expand boundaries by brush radius as per example
+        path_x_min = -(x_half + brush_radius)
+        path_x_max = (x_half + brush_radius)
+        path_y_min = -(y_half + brush_radius)
+        path_y_max = (y_half + brush_radius)
+        
+        # Calculate step size in X
+        # As per example: overlap=1.0, radius=0.1 => step=0.2. formula: 2*r/overlap
+        if overlap_factor <= 0:
+            self.get_logger().warn("Overlap factor must be > 0. Defaulting to 1.0")
+            overlap_factor = 1.0
+            
+        step_x = (2.0 * brush_radius) / overlap_factor
+
+        # Generate Waypoints
+        waypoints = []
+        current_x = path_x_min
+        
+        # Use a epsilon for float comparison to include the upper bound
+        epsilon = 1e-6
+        direction_up = True # Start moving Up (from y_min to y_max)
+        
+        # We need to iterate until we cover path_x_max
+        while current_x <= path_x_max + epsilon:
+            if direction_up:
+                waypoints.append((current_x, path_y_min))
+                waypoints.append((current_x, path_y_max))
+            else:
+                waypoints.append((current_x, path_y_max))
+                waypoints.append((current_x, path_y_min))
+            
+            direction_up = not direction_up
+            current_x += step_x
+
+        # Interpolation
+        final_points = []
+        interp_step = 0.1
+        
+        for i in range(len(waypoints) - 1):
+            p1 = waypoints[i]
+            p2 = waypoints[i+1]
+            
+            # Add the start point
+            final_points.append(p1)
+            
+            # Calculate distance and vector
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            dist = np.sqrt(dx*dx + dy*dy)
+            
+            if dist > 0:
+                vx = dx / dist
+                vy = dy / dist
+                
+                # Add sub-points
+                current_dist = interp_step
+                while current_dist < dist:
+                    sub_x = p1[0] + vx * current_dist
+                    sub_y = p1[1] + vy * current_dist
+                    final_points.append((sub_x, sub_y))
+                    current_dist += interp_step
+        
+        # Add the very last point
+        if waypoints:
+            final_points.append(waypoints[-1])
+
+        # Create PoseArray
+        self.generated_path = PoseArray()
+        # header will be set in publish_message
+        
+        for p in final_points:
+            pose = Pose()
+            pose.position.x = float(p[0])
+            pose.position.y = float(p[1])
+            pose.position.z = 0.0
+            pose.orientation.w = 1.0 # Identity quaternion
+            
+            self.generated_path.poses.append(pose)
+            
+        self.get_logger().info(f"Generated path with {len(self.generated_path.poses)} poses.")
+
     def publish_message(self):
         """
         Takes in the points, and corresponding surface normals, and publishes 
@@ -209,6 +332,37 @@ class PaintCloud(Node):
         # --- Publish Normals as Arrows ---
         marker_array = self.create_normal_markers(self.pcd, header)
         self.normal_pub.publish(marker_array)
+        
+        # --- Publish Path ---
+        if self.generated_path:
+            self.generated_path.header = header # Sync header
+            self.path_pub.publish(self.generated_path)
+
+        # --- Publish Surface Polygon ---
+        self.publish_surface_polygon(header)
+
+    def publish_surface_polygon(self, header):
+        """
+        Publishes a rectangle polygon representing the surface boundaries
+        """
+        surface_length_x = self.get_parameter('surface_length_x').get_parameter_value().double_value
+        surface_width_y = self.get_parameter('surface_width_y').get_parameter_value().double_value
+        
+        x_half = surface_length_x / 2.0
+        y_half = surface_width_y / 2.0
+        
+        polygon_msg = PolygonStamped()
+        polygon_msg.header = header
+        
+        # Define 4 corners (Counter Closkwise)
+        p1 = Point32(x=float(-x_half), y=float(-y_half), z=0.0)
+        p2 = Point32(x=float(x_half), y=float(-y_half), z=0.0)
+        p3 = Point32(x=float(x_half), y=float(y_half), z=0.0)
+        p4 = Point32(x=float(-x_half), y=float(y_half), z=0.0)
+        
+        polygon_msg.polygon.points = [p1, p2, p3, p4]
+        
+        self.polygon_pub.publish(polygon_msg)
 
     def create_pointcloud2_msg(self, points, header):
         """
