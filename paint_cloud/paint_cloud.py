@@ -14,6 +14,39 @@ from sensor_msgs_py import point_cloud2
 import tf2_ros
 import tf_transformations
 from geometry_msgs.msg import TransformStamped, PoseArray, Pose, PolygonStamped, Point32
+from scipy.spatial import cKDTree
+
+def quaternion_from_normal(normal):
+    """
+    Computes a quaternion (x, y, z, w) that aligns the Z-axis with the given normal vector.
+    Uses tf_transformations for the final quaternion generation.
+    """
+    normal = np.array(normal)
+    norm = np.linalg.norm(normal)
+    if norm == 0:
+        return [0.0, 0.0, 0.0, 1.0] # Identity
+    
+    normal = normal / norm
+    
+    # We want to rotate the standard Z axis (0, 0, 1) to the normal
+    start_vec = np.array([0.0, 0.0, 1.0])
+    
+    # Dot product and cross product
+    dot = np.dot(start_vec, normal)
+    cross = np.cross(start_vec, normal)
+    
+    # Check for parallel/anti-parallel
+    if dot > 0.999999:
+        return [0.0, 0.0, 0.0, 1.0]
+    elif dot < -0.999999:
+        # Rotate 180 deg around X
+        return list(tf_transformations.quaternion_about_axis(np.pi, [1.0, 0.0, 0.0]))
+    
+    # Calculate angle and axis
+    angle = np.arccos(np.clip(dot, -1.0, 1.0))
+    axis = cross / np.linalg.norm(cross)
+    
+    return list(tf_transformations.quaternion_about_axis(angle, axis))
 
 
 class PaintCloud(Node):
@@ -303,16 +336,50 @@ class PaintCloud(Node):
         self.generated_path = PoseArray()
         # header will be set in publish_message
         
-        for p in final_points:
-            pose = Pose()
-            pose.position.x = float(p[0])
-            pose.position.y = float(p[1])
-            pose.position.z = 0.0
-            pose.orientation.w = 1.0 # Identity quaternion
+        # Build KDTree for nearest neighbor search
+        # We project the 3D points to 2D (x, y) for the search
+        if self.points is not None and len(self.points) > 0:
+            # Ahhh, this can be optimized, but it works for now. I could have used depth image to get the points, but it was not working.
+            self.kd_tree = cKDTree(self.points[:, :2])
             
-            self.generated_path.poses.append(pose)
+            normals = np.asarray(self.pcd.normals)
             
-        self.get_logger().info(f"Generated path with {len(self.generated_path.poses)} poses.")
+            for p in final_points:
+                # Query nearest point in the cloud
+                dist, idx = self.kd_tree.query([p[0], p[1]])
+                
+                # Get the Z height from the surface point
+                surface_point = self.points[idx]
+                surface_z = surface_point[2]
+                
+                # Get the normal
+                normal = normals[idx]
+                
+                # Calculate orientation
+                orientation = quaternion_from_normal(normal)
+                
+                pose = Pose()
+                pose.position.x = float(p[0])
+                pose.position.y = float(p[1])
+                
+                # Adjust Z: surface height offset along the normal by brush radius
+                # Position = surface_point + normal * brush_radius
+                offset_pos = surface_point + normal * brush_radius
+                
+                pose.position.x = float(offset_pos[0])
+                pose.position.y = float(offset_pos[1])
+                pose.position.z = float(offset_pos[2])
+                
+                pose.orientation.x = orientation[0]
+                pose.orientation.y = orientation[1]
+                pose.orientation.z = orientation[2]
+                pose.orientation.w = orientation[3]
+                
+                self.generated_path.poses.append(pose)
+            
+            self.get_logger().info(f"Generated path with {len(self.generated_path.poses)} poses using KDTree projection.")
+        else:
+             self.get_logger().warn("No points available to build KDTree.")
 
     def publish_message(self):
         """

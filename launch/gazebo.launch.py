@@ -7,6 +7,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_share = get_package_share_directory('paint_cloud')
     sdf_file = os.path.join(pkg_share, 'worlds', 'realsense_world.sdf')
+    rviz_config_file = os.path.join(pkg_share, 'rviz', 'paint_cloud.rviz')
 
     ign_gazebo = ExecuteProcess(
         cmd=['ign', 'gazebo', '-r', sdf_file],
@@ -34,6 +35,13 @@ def generate_launch_description():
     rviz = Node(
         package='rviz2',
         executable='rviz2',
+        # arguments=['-d', rviz_config_file],
+        output='screen'
+    )
+
+    paint_cloud = Node(
+        package='paint_cloud',
+        executable='paint_cloud',
         output='screen'
     )
 
@@ -41,5 +49,6 @@ def generate_launch_description():
         ign_gazebo,
         bridge,
         static_tf,
+        paint_cloud,
         rviz
     ])
