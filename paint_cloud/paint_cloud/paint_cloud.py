@@ -17,6 +17,11 @@ from geometry_msgs.msg import TransformStamped, PoseArray, Pose, PolygonStamped,
 from paint_cloud_msgs.srv import GetPaintPath
 from scipy.spatial import cKDTree
 
+from geometry_msgs.msg import PoseStamped, PoseArray
+from tf2_geometry_msgs import do_transform_pose
+from tf2_ros import TransformException
+import rclpy
+
 def quaternion_from_normal(normal):
     """
     Computes a quaternion (x, y, z, w) that aligns the Z-axis with the given normal vector.
@@ -67,16 +72,16 @@ class PaintCloud(Node):
         # Subscribers
         self.create_subscription(
             PointCloud2,
-            '/realsense/points',
+            '/points',
             self.pointcloud_callback,
             10
         )
 
-        self.declare_parameter('downsample_factor', 100)
-        self.declare_parameter('brush_radius', 0.1)
+        self.declare_parameter('downsample_factor', 50)
+        self.declare_parameter('brush_radius', 0.05)
         self.declare_parameter('overlap_factor', 1.0)
-        self.declare_parameter('surface_length_x', 1.0)
-        self.declare_parameter('surface_width_y', 0.8)
+        self.declare_parameter('surface_length_x', 0.15)
+        self.declare_parameter('surface_width_y', 0.3)
 
         self.points = None
         self.pcd_header = None
@@ -113,7 +118,7 @@ class PaintCloud(Node):
                 response.poses.header = self.pcd_header
             
         return response
-    
+
     def scan_pc_generate_path(self):
         if self.points is None:
             self.get_logger().info("Waiting for pointcloud...")
@@ -123,7 +128,71 @@ class PaintCloud(Node):
         self.generate_path()
         self.publish_message()
         self.get_logger().info("Published the message")
-        return self.generated_path
+        return self.transform_pose_array(self.generated_path)
+    
+    def transform_pose_array(self, input_pose_array, target_frame='base_link1'):
+        """ Transforms a PoseArray from its header frame to the target_frame using manual matrix math. """
+        source_frame = input_pose_array.header.frame_id
+        if not source_frame:
+            source_frame = 'world'
+
+        if source_frame == target_frame:
+            return input_pose_array
+
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as ex:
+            self.get_logger().error(f'Could not transform {source_frame} to {target_frame}: {ex}')
+            return None
+
+        # Extract Translation and Rotation Matrix
+        t_vec = np.array([
+            trans.transform.translation.x,
+            trans.transform.translation.y,
+            trans.transform.translation.z
+        ])
+        
+        q_vec = [
+            trans.transform.rotation.x,
+            trans.transform.rotation.y,
+            trans.transform.rotation.z,
+            trans.transform.rotation.w
+        ]
+        R_mat = tf_transformations.quaternion_matrix(q_vec)[:3, :3]
+
+        output_pose_array = PoseArray()
+        output_pose_array.header = input_pose_array.header
+        output_pose_array.header.frame_id = target_frame
+
+        for i, pose in enumerate(input_pose_array.poses):
+            new_pose = Pose()
+            
+            p_old = np.array([pose.position.x, pose.position.y, pose.position.z])
+            p_new = np.dot(R_mat, p_old) + t_vec
+            
+            new_pose.position.x = p_new[0]
+            new_pose.position.y = p_new[1]
+            new_pose.position.z = p_new[2]
+            
+            q_old = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+            if np.linalg.norm(q_old) == 0:
+                q_old = [0, 0, 0, 1]
+            
+            q_new = tf_transformations.quaternion_multiply(q_vec, q_old)
+            
+            new_pose.orientation.x = q_new[0]
+            new_pose.orientation.y = q_new[1]
+            new_pose.orientation.z = q_new[2]
+            new_pose.orientation.w = q_new[3]
+            
+            output_pose_array.poses.append(new_pose)
+
+        self.get_logger().info(f"Manually transformed {len(output_pose_array.poses)} poses from {source_frame} to {target_frame}")
+        return output_pose_array
 
     def generate_mock_pc(self):
         """
@@ -156,11 +225,12 @@ class PaintCloud(Node):
     def pointcloud_callback(self, msg):
         new_points = None
         
-        # Optimize for the specific Realsense format provided
-        # x(0), y(4), z(8), rgb(16), point_step=24, Little Endian (usually)
+        # ---------------------------------------------------------
+        # Case 1: RealSense Format (x, y, z, skip, rgb, skip)
+        # Point Step: 24
+        # ---------------------------------------------------------
         if msg.point_step == 24:
             try:
-                # Structured dtype matching the memory layout
                 dtype_list = [
                     ('x', '<f4'),
                     ('y', '<f4'),
@@ -170,22 +240,46 @@ class PaintCloud(Node):
                     ('skip2', 'V4')  # Offset 20-24
                 ]
                 
-                # If big endian, swap byte order in dtype
                 if msg.is_bigendian:
                     dtype_list = [(n, f.replace('<', '>')) for n, f in dtype_list]
                 
                 raw_data = np.frombuffer(msg.data, dtype=dtype_list)
-                
-                # Stack x, y, z
                 points = np.column_stack((raw_data['x'], raw_data['y'], raw_data['z']))
                 
                 # Filter NaNs
-                # Check for NaNs in any coordinate
                 mask = ~np.isnan(points).any(axis=1)
                 new_points = points[mask]
 
             except Exception as e:
-                self.get_logger().warn(f"Fast parse failed: {e}. Falling back to standard reader.")
+                self.get_logger().warn(f"Fast parse (RealSense) failed: {e}. Falling back to standard reader.")
+
+        # ---------------------------------------------------------
+        # Case 2: LiDAR Format (x, y, z, intensity)
+        # Point Step: 16
+        # ---------------------------------------------------------
+        elif msg.point_step == 16:
+            try:
+                # Layout based on your ros2 topic echo:
+                # x(0), y(4), z(8), intensity(12) -> All float32 (<f4)
+                dtype_list = [
+                    ('x', '<f4'),
+                    ('y', '<f4'),
+                    ('z', '<f4'),
+                    ('intensity', '<f4')
+                ]
+                
+                if msg.is_bigendian:
+                    dtype_list = [(n, f.replace('<', '>')) for n, f in dtype_list]
+                    
+                raw_data = np.frombuffer(msg.data, dtype=dtype_list)
+                points = np.column_stack((raw_data['x'], raw_data['y'], raw_data['z']))
+                
+                # Filter NaNs
+                mask = ~np.isnan(points).any(axis=1)
+                new_points = points[mask]
+                
+            except Exception as e:
+                self.get_logger().warn(f"Fast parse (LiDAR) failed: {e}. Falling back to standard reader.")
         
         if new_points is None:
             # Fallback for other formats

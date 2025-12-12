@@ -2,7 +2,14 @@
 
 A ROS 2 package for generating robot manipulator painting paths from 3D perception data.
 
-This package scans the environment using a depth camera (simulated in Gazebo), computes surface normals from the point cloud, and generates a coverage path (zig-zag pattern) for a painting end-effector. The path conforms to the surface curvature and aligns the end-effector orientation with the surface normals.
+## Project Overview
+
+**Goal**: Develop a real-time system that scans an arbitrary object, plans a coverage path adaptively, and executes the painting trajectory using a UR5-based manipulator.
+
+**Methodology**:
+1.  **Sense**: Use 3D LiDAR/Depth camera to scan the environment and generate a point cloud.
+2.  **Plan**: Compute surface normals (PCA), generate a 2D coverage pattern, and project it onto the 3D surface using a KD-Tree.
+3.  **Execute**: Solve Inverse Kinematics (Jacobian-based) to guide the end-effector along the planned path while maintaining surface-normal orientation.
 
 ## Features
 
@@ -59,18 +66,20 @@ This package scans the environment using a depth camera (simulated in Gazebo), c
 
 ### Launching the Simulation
 
-This launches Ignition Gazebo with a RealSense camera environment, the ROS-Ignition bridge, RViz2, and the `paint_cloud` node.
+This launches Gazebo with a LiDAR scanner in the environment, RViz2, and URDF and controllers.
 
 ```bash
-ros2 launch paint_cloud gazebo.launch.py
+ros2 launch paint_cloud classic.launch.py
 ```
 
-### Triggering Path Generation
-
-The node starts automatically but waits for a service call to generate and return the path.
-
+Launch the path planning node
 ```bash
-ros2 service call /get_paint_path paint_cloud_msgs/srv/GetPaintPath {}
+ros2 run paint_cloud paint_cloud
+```
+
+Trace the path using IK solver, which can calls the planning node to get the path
+```bash
+ros2 run my_ik_controller jacobian_mover
 ```
 
 ### Parameters
@@ -84,16 +93,6 @@ You can configure the following parameters in `paint_cloud.py`:
 | `overlap_factor` | `1.0` | Overlap between painting strokes (1.0 - no overlap, 0.5 - half overlap). |
 | `surface_length_x` | `1.0` | Length of the target surface area (meters). |
 | `surface_width_y` | `0.8` | Width of the target surface area (meters). |
-
-### Topics
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/realsense/points` | `sensor_msgs/PointCloud2` | Input point cloud from the camera. |
-| `curved_cloud` | `sensor_msgs/PointCloud2` | Processed point cloud in world frame. |
-| `surface_normals` | `visualization_msgs/MarkerArray` | Visual markers for surface normals. |
-| `paint_path` | `geometry_msgs/PoseArray` | The generated coverage path with orientations. |
-| `surface_polygon` | `geometry_msgs/PolygonStamped` | Visualization of the target surface boundaries. |
 
 ### Services
 

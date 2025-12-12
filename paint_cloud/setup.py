@@ -18,8 +18,18 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
 
         # Install world files
-        (os.path.join('share', package_name, 'worlds'), glob('worlds/*.sdf')),
+        (os.path.join('share', package_name, 'worlds'), glob('worlds/*.sdf') + glob('worlds/*.world')),
         
+        # Install urdf files
+        (os.path.join('share', package_name, 'urdf'), glob('urdf/*.urdf')),
+
+        # Install mesh files
+        (os.path.join('share', package_name, 'urdf/meshes/visual'), glob('urdf/meshes/visual/*')),
+        (os.path.join('share', package_name, 'urdf/meshes/collision'), glob('urdf/meshes/collision/*')),
+
+        # Install config files
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+
         # Install rviz
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
     ],
